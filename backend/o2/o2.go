@@ -260,19 +260,25 @@ func NewFs(ctx context.Context, name string, root string, config configmap.Mappe
 	// find root
 	err = f.dirCache.FindRoot(ctx, false)
 	if err != nil {
-		// assume it is a file
+		// root is not a directory: it may be a file or not exist.
+		// Either way we must return an Fs rooted at the PARENT so rclone
+		// can operate on the leaf (file move, chunker composite detection...).
 		newRoot, remote := dircache.SplitPath(root)
 		tempF := *f
 		tempF.dirCache = dircache.New(newRoot, rootID, &tempF)
 		tempF.root = newRoot
 		err = tempF.dirCache.FindRoot(ctx, false)
 		if err != nil {
-			// no root so return old f
-			return f, nil
+			// parent doesn't exist either — return parent-rooted fs
+			return &tempF, nil
 		}
 		_, err := tempF.NewObject(ctx, remote)
 		if err != nil {
 			if err == fs.ErrorObjectNotFound {
+				// leaf does not exist: return parent-rooted fs, no ErrorIsFile
+				f.features.Fill(ctx, &tempF)
+				f.dirCache = tempF.dirCache
+				f.root = tempF.root
 				return f, nil
 			}
 			return nil, err
