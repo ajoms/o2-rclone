@@ -144,12 +144,31 @@ rclone copy o2media:backups /path/restore
 ```
 
 Notes:
-- `chunk_size=3.5G` keeps each chunk safely under the server limit (with the
-  default `hash_type=md5` the chunk names carry a hash suffix).
-- The chunks are stored as raw ciphertext fragments (the crypt layer wraps the
-  chunker), so data is encrypted at rest and reassembled+decrypted on read.
+- `transactions=norename` is required: O2 rejects `save-metadata` renames
+  during the ~10s media validation window (MED-1017), so chunks keep their
+  temp transaction suffix and the `simplejson` meta file records the xactID
+  used to locate them on read.
+- `chunk_size=3.5G` keeps each chunk safely under the server's ~4-5 GB cap.
+- The crypt layer wraps the chunker, so each stored chunk is a raw ciphertext
+  fragment — encrypted at rest, reassembled + decrypted on read.
 - The O2 web/app will show the chunk files, not the original movie — this is
-  a backup target, not a streaming library.
+  a backup target; playback works through rclone mount (reassembly is
+  transparent).
+
+### Playing movies in Plex (streaming from O2)
+
+```bash
+# macOS: install macFUSE once, then mount
+brew install --cask macfuse
+rclone mount o2chunk: /Volumes/O2Cloud \
+  --vfs-cache-mode full --dir-cache-time 60s --volname "O2Cloud"
+
+# Point Plex at /Volumes/O2Cloud — it sees the full movie files.
+# rclone streams the chunks on demand (full cache mode buffers locally for
+# smooth playback).
+```
+
+No-macFUSE alternative (Finder-only, no Plex): `rclone serve webdav o2chunk: --addr 127.0.0.1:8099` then Finder Cmd+K to `http://127.0.0.1:8099/`.
 
 ## License
 
