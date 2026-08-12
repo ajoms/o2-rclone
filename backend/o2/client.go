@@ -831,9 +831,9 @@ func (c *Client) moveItem(ctx context.Context, item *o2Item, newName string, new
 	}
 
 	payload := map[string]any{"data": map[string]any{
-		"id":       item.id,
+		"id":       o2Int(item.id),
 		"name":     newName,
-		"folderid": newParentID,
+		"folderid": o2Int(newParentID),
 	}}
 	params := url.Values{"action": {"save-metadata"}, "acceptasynchronous": {"true"}}
 	resp, err := c.request(ctx, "POST", "upload/"+mediaKind, params, payload)
@@ -845,6 +845,15 @@ func (c *Client) moveItem(ctx context.Context, item *o2Item, newName string, new
 		return fmt.Errorf("move file: HTTP %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// o2Int converts a numeric id string to an int (the O2 API rejects string
+// ids in save-metadata payloads). Non-numeric values are passed through.
+func o2Int(v string) any {
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+		return n
+	}
+	return v
 }
 
 // updateModTime updates modification time via save-metadata
