@@ -118,6 +118,39 @@ backend/o2/
   o2-reauth.py       — Session check + auto-renewal helper
 ```
 
+## Backing up large files (4-60 GB movies)
+
+O2 Cloud rejects files larger than ~4-5 GB (`MED-1020`). To back up a movie
+library (e.g. an encrypted rclone crypt library), wrap the `o2` remote with
+rclone's **chunker** backend, which transparently splits large files into
+chunks under the limit and reassembles them on read:
+
+```
+o2            (native backend)
+  └─ o2chunk   (chunker: remote=o2native:, chunk_size=3.5G)
+       └─ o2media (crypt: remote=o2chunk, your password)   ← use this
+```
+
+```bash
+# One-time setup
+rclone config create o2chunk chunker remote=o2native: chunk_size=3.5G
+rclone config create o2media crypt remote=o2chunk   password="$(rclone obscure 'YOUR_PASS')" salt="$(rclone obscure 'YOUR_SALT')"
+
+# Backup (movie appears as ONE file on o2media, stored as ≤3.5G chunks on O2)
+rclone copy /path/movies o2media:backups
+
+# Restore to any local/shared-drive location (reassembles + decrypts)
+rclone copy o2media:backups /path/restore
+```
+
+Notes:
+- `chunk_size=3.5G` keeps each chunk safely under the server limit (with the
+  default `hash_type=md5` the chunk names carry a hash suffix).
+- The chunks are stored as raw ciphertext fragments (the crypt layer wraps the
+  chunker), so data is encrypted at rest and reassembled+decrypted on read.
+- The O2 web/app will show the chunk files, not the original movie — this is
+  a backup target, not a streaming library.
+
 ## License
 
 This project is based on [rclone](https://github.com/rclone/rclone) (MIT) and reverse-engineered from the O2 Cloud API using the open-source [o2cloud_gateway_webdav](https://github.com/garanda21/o2cloud_gateway_webdav) (MIT) as reference.
