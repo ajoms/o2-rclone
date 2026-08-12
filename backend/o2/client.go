@@ -553,36 +553,45 @@ func (c *Client) upload(ctx context.Context, parentID, name string, size int64, 
 	contentType := guessContentType(name)
 	uploadURL := c.buildUploadURL(params)
 
-	// Build multipart body in memory
-	var bodyBuf []byte
+	// Streaming multipart upload (no in-memory buffering of the file).
 	boundary := "----O2RcloneBoundary12345"
 
-	// data field
-	bodyBuf = append(bodyBuf, fmt.Sprintf("--%s\r\n", boundary)...)
-	bodyBuf = append(bodyBuf, fmt.Sprintf("Content-Disposition: form-data; name=\"data\"\r\n\r\n")...)
-	bodyBuf = append(bodyBuf, dataJSON...)
-	bodyBuf = append(bodyBuf, "\r\n"...)
+	// Precompute the fixed part sizes so we can set an exact Content-Length
+	// while still streaming the file body (avoids chunked transfer encoding).
+	dataPart := fmt.Sprintf("--%s\r\nContent-Disposition: form-data; name=\"data\"\r\n\r\n%s\r\n", boundary, dataJSON)
+	fileHeader := fmt.Sprintf("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\nContent-Type: %s\r\n\r\n", boundary, name, contentType)
+	closing := fmt.Sprintf("\r\n--%s--\r\n", boundary)
+	contentLength := int64(len(dataPart)) + int64(len(fileHeader)) + size + int64(len(closing))
 
-	// file field header
-	bodyBuf = append(bodyBuf, fmt.Sprintf("--%s\r\n", boundary)...)
-	bodyBuf = append(bodyBuf, fmt.Sprintf("Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n", name)...)
-	bodyBuf = append(bodyBuf, fmt.Sprintf("Content-Type: %s\r\n\r\n", contentType)...)
+	pipeIn, pipeOut := io.Pipe()
+	writeErr := make(chan error, 1)
+	go func() {
+		defer pipeOut.Close()
+		if _, err := io.WriteString(pipeOut, dataPart); err != nil {
+			writeErr <- err
+			return
+		}
+		if _, err := io.WriteString(pipeOut, fileHeader); err != nil {
+			writeErr <- err
+			return
+		}
+		if _, err := io.Copy(pipeOut, in); err != nil {
+			writeErr <- err
+			return
+		}
+		if _, err := io.WriteString(pipeOut, closing); err != nil {
+			writeErr <- err
+			return
+		}
+		writeErr <- nil
+	}()
 
-	// file content
-	fileData, err := io.ReadAll(in)
+	req, err := http.NewRequestWithContext(ctx, "POST", uploadURL, pipeIn)
 	if err != nil {
-		return nil, fmt.Errorf("read upload data: %w", err)
-	}
-	bodyBuf = append(bodyBuf, fileData...)
-	bodyBuf = append(bodyBuf, "\r\n"...)
-
-	// closing boundary
-	bodyBuf = append(bodyBuf, fmt.Sprintf("--%s--\r\n", boundary)...)
-
-	req, err := http.NewRequestWithContext(ctx, "POST", uploadURL, strings.NewReader(string(bodyBuf)))
-	if err != nil {
+		pipeIn.Close()
 		return nil, err
 	}
+	req.ContentLength = contentLength
 	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
@@ -592,9 +601,19 @@ func (c *Client) upload(ctx context.Context, parentID, name string, size int64, 
 
 	resp, err := c.f.httpClient.Do(req)
 	if err != nil {
+		pipeIn.Close()
+		// If the write goroutine failed first, report that instead.
+		select {
+		case werr := <-writeErr:
+			if werr != nil {
+				return nil, fmt.Errorf("upload stream error: %w", werr)
+			}
+		default:
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
+	_ = <-writeErr // drain the writer goroutine result
 
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
 		c.recoverSession(resp)

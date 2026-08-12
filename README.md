@@ -96,17 +96,16 @@ For `rclone mount`, the keepalive runs in the background. For short commands (`l
 
 ## Limitations
 
-- ~4 GB per file (O2 Cloud service limit)
-- ~10,000 folders (O2 Cloud service limit)  
+- **Max file size: ~4-5 GB (server-enforced, hard limit).** Confirmed
+  empirically: 4 GiB uploads are accepted; 5 GiB and larger are rejected with
+  `MED-1020: File size exceeds configured max file size limit`. This is a
+  server-side policy. Chunked uploads do NOT bypass it, because the total file
+  size is declared in the metadata and rejected before any data transfer.
+  Files larger than the limit (e.g. 20-60 GB) must be split client-side or
+  stored on another provider.
+- ~10,000 folders (O2 Cloud service limit)
 - No native file hashes — rclone uses size + mtime for comparison
 - Eventual consistency: ~2-5s delay after upload before file appears in listing
-
-## Building for other platforms
-
-```bash
-GOOS=linux GOARCH=amd64 go build -o build/rclone-linux-amd64 .
-GOOS=linux GOARCH=arm64 go build -o build/rclone-linux-arm64 .
-```
 
 ## Files
 
