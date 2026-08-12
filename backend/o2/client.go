@@ -260,6 +260,43 @@ func (c *Client) requestWithRetry(ctx context.Context, method, resource string, 
 	return resp, nil
 }
 
+// requestForm performs a POST with the body encoded as the `data` form field
+// (application/x-www-form-urlencoded). The O2 SAPI requires this format for
+// `upload/*?action=save-metadata` (rename) — a raw JSON body makes the server
+// create a duplicate instead of renaming.
+func (c *Client) requestForm(ctx context.Context, resource string, params url.Values, body any) (*http.Response, error) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal form body: %w", err)
+	}
+	form := url.Values{}
+	form.Set("data", string(data))
+	reqURL := c.buildURL(resource, params)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	for k, v := range c.baseHeaders() {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := c.f.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		resp.Body.Close()
+		if err := c.recoverSession(resp); err == nil {
+			return c.requestForm(ctx, resource, params, body)
+		}
+	}
+	return resp, nil
+}
+
 func (c *Client) recoverSession(rejectedResp *http.Response) error {
 	// check if the 401 response contains a rotated bundle in authorization header
 	if auth := rejectedResp.Header.Get("Authorization"); auth != "" {
@@ -836,7 +873,7 @@ func (c *Client) moveItem(ctx context.Context, item *o2Item, newName string, new
 		"folderid": o2Int(newParentID),
 	}}
 	params := url.Values{"action": {"save-metadata"}, "acceptasynchronous": {"true"}}
-	resp, err := c.request(ctx, "POST", "upload/"+mediaKind, params, payload)
+	resp, err := c.requestForm(ctx, "upload/"+mediaKind, params, payload)
 	if err != nil {
 		return err
 	}
@@ -868,7 +905,7 @@ func (c *Client) updateModTime(ctx context.Context, item *o2Item, modTime time.T
 		"modificationdate": modTime.Format("2006-01-02T15:04:05"),
 	}}
 	params := url.Values{"action": {"save-metadata"}}
-	resp, err := c.request(ctx, "POST", "upload/"+mediaKind, params, payload)
+	resp, err := c.requestForm(ctx, "upload/"+mediaKind, params, payload)
 	if err != nil {
 		return err
 	}
