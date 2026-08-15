@@ -94,6 +94,13 @@ The backend includes a keepalive goroutine (enabled by `keepalive_seconds`). Eve
 
 For `rclone mount`, the keepalive runs in the background. For short commands (`lsd`, `copy`), the renewal happens only on 401 errors.
 
+> **Note (oauth_bundle vs web login):** Fully silent renewal (no SMS) requires the session
+> to carry an `oauth_bundle`, which only the native-app/mitmproxy capture produces (see
+> "Alternative: capture session from the native O2 app" at the bottom). Sessions captured
+> through the gateway/browser login (Option A) have an empty `oauth_bundle`, so the keepalive
+> cannot rotate them: when that session expires you must re-validate via the web login
+> (`o2-reauth.py`), which opens the O2 login page in Chromium (no native app involved).
+
 ## Limitations
 
 - **Max file size: ~4-5 GB (server-enforced, hard limit).** Confirmed
@@ -111,12 +118,43 @@ For `rclone mount`, the keepalive runs in the background. For short commands (`l
 
 ```
 backend/o2/
-  o2.go              — Backend registration, Fs, Object, Config wizard
-  client.go          — SAPI HTTP client, auth, renewal, keepalive, uploads
-  login.go           — `authorize` command + session capture
-  o2_authorize.py    — Playwright-based interactive login helper
-  o2-reauth.py       — Session check + auto-renewal helper
+  o2.go                   — Backend registration, Fs, Object, Config wizard
+  client.go               — SAPI HTTP client, auth, renewal, keepalive, uploads
+  login.go                — `authorize` command + session capture
+  o2_authorize.py         — Playwright-based interactive login helper (web validation)
+  o2-reauth.py            — Session check + auto-renewal (triggers the gateway web login)
+  o2-reauth.py.notify     — Same as o2-reauth.py + macOS notifications, exponential backoff
+                             and tri-state session check (recommended variant)
+  o2_read_gateway_session.py — reads the fresh session from the gateway store (required by
+                             o2-reauth.py)
+  o2_reauth_capture.py    — mitmproxy addon: captures oauth_bundle from the native O2 app
+  apply_o2_session.py     — applies a captured o2_session.json to rclone.conf
+  capture-o2-session.sh   — orchestrates the mitmproxy capture with the native O2 app
 ```
+
+## Session renewal (web login)
+
+`o2-reauth.py` (and the `.notify` variant) is meant to run on a schedule (e.g. every 10 minutes
+via launchd). It:
+
+1. Checks the `o2native` session with a lightweight SAPI call.
+2. When expired, triggers the gateway (`http://127.0.0.1:8088/api/admin/o2/login`) which opens
+   the O2 web login in Chromium via Playwright. **No native O2 app involved.**
+3. Waits for you to validate with SMS, then writes the fresh `validation_key` and
+   `cookie_jsessionid` back to `rclone.conf`.
+
+Differences between the two variants:
+
+| Feature | `o2-reauth.py` | `o2-reauth.py.notify` |
+|---|---|---|
+| macOS notification on expiry / success / failure | — | ✅ |
+| Exponential backoff (30 min → 1 h → 2 h) | — | ✅ |
+| Ignores transient network errors (tri-state check) | — | ✅ |
+| Avoids duplicate login windows | — | ✅ |
+
+To switch to the improved variant:
+`cp backend/o2/o2-reauth.py.notify backend/o2/o2-reauth.py` (keep the original as backup) and
+restart the scheduler if needed.
 
 ## Backing up large files (4-60 GB movies)
 

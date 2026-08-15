@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""O2 reauth: check o2native session; if expired, pop login window and update config.
+
+Enhancements:
+  * Tri-state session check (ok / expired / error) so transient network errors do
+    not open a login window.
+  * macOS Notification Center alerts on expiry, success and failure.
+  * Exponential backoff: repeated failed logins are retried less often instead of
+    opening a new Chromium window every 10 minutes.
+  * State persisted to ~/.config/rclone/o2-reauth-state.json.
+"""
+import configparser
+import hashlib
+import hmac
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+HOME = os.path.expanduser("~")
+RCLONE_CONF = os.path.join(HOME, ".config/rclone/rclone.conf")
+STATE_FILE = os.path.join(HOME, ".config/rclone/o2-reauth-state.json")
+GATEWAY_DIR = os.path.join(HOME, "o2cloud-gateway")
+GATEWAY_URL = "http://127.0.0.1:8088"
+GATEWAY_ENCRYPTION_KEY = os.path.join(GATEWAY_DIR, "secrets/app_encryption_key.txt")
+GATEWAY_ADMIN_PASS = os.path.join(GATEWAY_DIR, "secrets/admin_password.txt")
+
+LOGIN_TIMEOUT = 320            # gateway login task gives up at 300s; poll slightly longer
+BACKOFF_SCHEDULE = [0, 1800, 3600, 7200]   # seconds for failure counts 0, 1, 2, >=3
+REMINDER_INTERVAL = 3600       # re-notify at most once per hour while in backoff
+
+
+def log(msg):
+    print("[o2-reauth]", msg, flush=True)
+
+
+def _escape(s):
+    return str(s).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def notify(title, message, sound="Glass"):
+    script = 'display notification "%s" with title "%s"' % (_escape(message), _escape(title))
+    if sound:
+        script += ' sound name "%s"' % _escape(sound)
+    try:
+        subprocess.run(["osascript", "-e", script], timeout=10)
+    except Exception as e:
+        log("notification failed: %s" % e)
+
+
+# ---- persisted state -------------------------------------------------------
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        log("could not save state: %s" % e)
+
+
+def backoff_seconds(failures):
+    return BACKOFF_SCHEDULE[min(int(failures), len(BACKOFF_SCHEDULE) - 1)]
+
+
+# ---- rclone config ---------------------------------------------------------
+def current_session(remote):
+    cp = configparser.ConfigParser()
+    cp.read(RCLONE_CONF)
+    if remote not in cp:
+        return None
+    s = cp[remote]
+    return {
+        "validation_key": s.get("validation_key", ""),
+        "cookie_jsessionid": s.get("cookie_jsessionid", ""),
+    }
+
+
+def update_config(remote, sess):
+    cp = configparser.ConfigParser()
+    cp.read(RCLONE_CONF)
+    if remote not in cp:
+        log("remote %s not found" % remote)
+        return False
+    cp[remote]["validation_key"] = sess["validation_key"]
+    if sess.get("cookie_jsessionid"):
+        cp[remote]["cookie_jsessionid"] = sess["cookie_jsessionid"]
+    with open(RCLONE_CONF, "w") as f:
+        cp.write(f)
+    return True
+
+
+# ---- session check (tri-state) ----------------------------------------------
+def check_session(vk, js):
+    """Return (verdict, detail) where verdict is one of ok / expired / error."""
+    url = ("https://cloud.o2online.es/sapi/media"
+           "?action=get-storage-space&softdeleted=true&validationkey=" + vk)
+    cmd = [
+        "curl", "-sS", "-m", "15",
+        "-w", "\n__O2REAUTH_HTTP__%{http_code}",
+        "-H", "Cookie: JSESSIONID=" + js,
+        "-H", "X-deviceid: O2CloudRclone",
+        "-H", "X-devicename: O2 Cloud",
+        "-H", "Accept: application/json",
+        "-H", "Origin: https://cloud.o2online.es",
+        "-H", "Referer: https://cloud.o2online.es/",
+        url,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except Exception:
+        return ("error", "timeout")
+    if r.returncode != 0:
+        return ("error", "curl-%d" % r.returncode)
+
+    out = r.stdout or ""
+    if "__O2REAUTH_HTTP__" in out:
+        body, _, code = out.rpartition("__O2REAUTH_HTTP__")
+    else:
+        body, code = out, ""
+    body = body.strip()
+    code = code.strip()
+
+    if code in ("401", "403"):
+        return ("expired", code)
+    if '"data"' in body and '"error"' not in body:
+        return ("ok", code)
+    if code.startswith("2"):
+        # 2xx without a clean data envelope == session rejected (matches old behaviour)
+        return ("expired", code)
+    return ("error", code or "unknown")
+
+
+# ---- gateway admin API -------------------------------------------------------
+def gateway_admin():
+    with open(GATEWAY_ADMIN_PASS) as f:
+        password = f.read().strip()
+    data = urllib.parse.urlencode({"username": "admin", "password": password}).encode()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+    opener.open(
+        urllib.request.Request(GATEWAY_URL + "/admin/login", data=data, method="POST"),
+        timeout=10,
+    )
+    cookie = ""
+    for handler in opener.handlers:
+        if hasattr(handler, "cookiejar"):
+            for c in handler.cookiejar:
+                if c.name == "admin_session":
+                    cookie = c.value
+    with open(GATEWAY_ENCRYPTION_KEY) as f:
+        secret = f.read().rstrip("\n").encode()
+    csrf = hmac.new(secret, ("csrf:" + cookie).encode(), hashlib.sha256).hexdigest()
+    return opener, csrf
+
+
+def login_status(opener):
+    req = urllib.request.Request(GATEWAY_URL + "/api/admin/o2/login/status")
+    return json.loads(opener.open(req, timeout=10).read().decode())
+
+
+def trigger_login(opener, csrf):
+    req = urllib.request.Request(
+        GATEWAY_URL + "/api/admin/o2/login",
+        method="POST",
+        headers={"X-CSRF-Token": csrf},
+    )
+    return json.loads(opener.open(req, timeout=10).read().decode())
+
+
+def wait_login(opener, timeout=LOGIN_TIMEOUT):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            st = login_status(opener)
+            if st.get("state") == "succeeded":
+                return True
+            if st.get("state") == "failed":
+                log("login failed: " + str(st.get("error")))
+                return False
+        except Exception:
+            pass
+        time.sleep(5)
+    log("login timed out")
+    return False
+
+
+def read_gateway_session():
+    reader = os.path.join(os.path.dirname(os.path.abspath(__file__)), "o2_read_gateway_session.py")
+    r = subprocess.run(
+        [os.path.join(GATEWAY_DIR, ".venv/bin/python3"), reader],
+        capture_output=True, text=True, timeout=30,
+    )
+    lines = r.stdout.strip().splitlines()
+    if r.returncode != 0 or len(lines) < 2 or lines[0] == "NONE":
+        return None
+    return {"validation_key": lines[0], "cookie_jsessionid": lines[1]}
+
+
+# ---- main --------------------------------------------------------------------
+def main():
+    force = "--force" in sys.argv
+    remote = "o2native"
+    if "--remote" in sys.argv:
+        remote = sys.argv[sys.argv.index("--remote") + 1]
+
+    session = current_session(remote)
+    if not session:
+        log("remote %s not found" % remote)
+        return 2
+
+    state = load_state()
+    now = time.time()
+
+    if not force:
+        verdict, detail = check_session(session["validation_key"], session.get("cookie_jsessionid", ""))
+        if verdict == "ok":
+            if state.get("failures"):
+                log("session recovered; resetting failure count")
+                state["failures"] = 0
+                state["backoff_until"] = 0
+                state["last_notified"] = 0
+                save_state(state)
+            log("session OK for %s" % remote)
+            return 0
+        if verdict == "error":
+            log("session check inconclusive (%s); skipping login" % detail)
+            return 0
+        # verdict == "expired" -> proceed
+
+    failures = int(state.get("failures", 0))
+    backoff_until = float(state.get("backoff_until", 0))
+    last_notified = float(state.get("last_notified", 0))
+
+    if not force and now < backoff_until:
+        remaining = int(backoff_until - now)
+        if now - last_notified >= REMINDER_INTERVAL:
+            notify("O2 Cloud — sesión aún caducada",
+                   "Reintentaré el login en ~%d min." % (remaining // 60 + 1), sound="Glass")
+            state["last_notified"] = now
+            save_state(state)
+        log("backoff active: skip login for %d more seconds (failures=%d)" % (remaining, failures))
+        return 0
+
+    log("session expired for %s, opening login popup..." % remote)
+    notify("O2 Cloud — sesión caducada",
+           "Abriendo ventana de login. Completa el acceso con SMS.", sound="Glass")
+
+    try:
+        opener, csrf = gateway_admin()
+    except Exception as e:
+        log("could not reach gateway admin: %s" % e)
+        return 2
+
+    try:
+        st = login_status(opener)
+        if st.get("state") == "running":
+            log("login already in progress; waiting for it")
+        else:
+            trigger_login(opener, csrf)
+            log("login window opened - complete O2 login in the Chromium window")
+    except Exception as e:
+        log("could not trigger gateway login: %s" % e)
+        return 2
+
+    if wait_login(opener):
+        new_session = read_gateway_session()
+        if not new_session:
+            log("could not read fresh session")
+            return 1
+        if update_config(remote, new_session):
+            state["failures"] = 0
+            state["backoff_until"] = 0
+            state["last_notified"] = 0
+            save_state(state)
+            log("session updated for %s" % remote)
+            notify("O2 Cloud — sesión renovada", "La sesión de rclone se actualizó correctamente.")
+            return 0
+        return 1
+
+    failures += 1
+    wait = backoff_seconds(failures)
+    state["failures"] = failures
+    state["backoff_until"] = now + wait
+    state["last_notified"] = now
+    save_state(state)
+    log("login failed; will retry in ~%d min (failure #%d)" % (wait // 60 + 1, failures))
+    notify("O2 Cloud — no se pudo renovar",
+           "El login no se completó. Reintentaré en ~%d min." % (wait // 60 + 1), sound="Glass")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
