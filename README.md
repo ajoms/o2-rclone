@@ -173,3 +173,19 @@ No-macFUSE alternative (Finder-only, no Plex): `rclone serve webdav o2chunk: --a
 ## License
 
 This project is based on [rclone](https://github.com/rclone/rclone) (MIT) and reverse-engineered from the O2 Cloud API using the open-source [o2cloud_gateway_webdav](https://github.com/garanda21/o2cloud_gateway_webdav) (MIT) as reference.
+
+## Alternative: capture session from the native O2 app (mitmproxy backup)
+
+If you prefer to avoid the browser login and instead capture a renewable session directly from
+the O2 Cloud desktop app (one-time SMS login inside the app), use the mitmproxy helper:
+
+1. Install the O2 Cloud app and trust the mitmproxy CA once:
+   `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ~/.mitmproxy/mitmproxy-ca-cert.pem`
+2. Run: `backend/o2/capture-o2-session.sh`
+
+It starts `mitmdump` with `o2_reauth_capture.py`, opens the app through the proxy, waits for
+`o2_session.json`, and applies the session with `apply_o2_session.py` (sets `validation_key`,
+`oauth_bundle` and `cookie_jsessionid` on the `o2native` remote).
+
+This is kept as a backup approach; the default is the web-validation flow (rclone + gateway
+browser login). `o2_read_gateway_session.py` is a runtime dependency of `o2-reauth.py`.
